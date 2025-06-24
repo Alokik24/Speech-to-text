@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speech to Text</title>
+    <style>
+        body {
+            max-width: 600px;
+            margin: auto;
+            font-family: sans-serif;
+            padding: 2em;
+        }
+        input, button {
+            margin-top: 1em;
+            padding: 0.5em;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+            padding: 1em;
+            border-radius: 5px;
+            margin: 1em 0;
+        }
+        .transcript {
+            white-space: pre-wrap;
+            border: 1px solid #ccc;
+            padding: 1em;
+            max-height: 500px;
+            overflow-y: auto;
+            margin-top: 1em;
+        }
+    </style>
+</head>
+<body>
+    <h2>Upload audio to transcribe</h2>
+    
+    <form enctype="multipart/form-data" method="post">
+        <input type="file" name="audio" accept="audio/*" required>
+        <button type="submit">Transcribe</button>
+    </form>
+
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+
+    {% if transcript %}
+    <h3>Transcript</h3>
+    <div class="transcript">{{ transcript }}</div>
+    <a href="data:text/plain;charset=utf-8,{{ transcript | urlencode }}" download="transcript.txt">Download Transcript</a>
+    {% endif %}
+
+    <script>
+        const form = document.querySelector("form");
+        form.addEventListener("submit", () => {
+            const button = form.querySelector("button");
+            button.disabled = true;
+            button.innerText = "Transcribing...";
+        });
+    </script>
+</body>
+</html>
