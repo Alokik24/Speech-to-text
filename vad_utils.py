@@ -102,57 +102,20 @@ def read_audio_mono(file_path, target_sr=16000):
     
     return waveform, target_sr
 
-def split_audio_tensor(audio_tensor, sample_rate, chunk_duration_sec=60):
+def get_speech_segments(audio_tensor, sample_rate, min_duration_sec=0.5, max_silence_sec=1.0):
     """
-    Splits a long audio tensor into smaller chunks (default 60s).
-    Returns a list of chunks.
-    """
-    if len(audio_tensor) == 0:
-        return []
+    Simplified and optimized speech segment extraction using Silero VAD.
     
-    chunk_len = int(sample_rate * chunk_duration_sec)
-    chunks = []
-    for i in range(0, len(audio_tensor), chunk_len):
-        chunk = audio_tensor[i:i+chunk_len]
-        if len(chunk) > 0:  # Only add non-empty chunks
-            chunks.append(chunk)
-    return chunks
-
-def merge_segments(timestamps, sample_rate, max_silence_sec=0.5):
-    """
-    Merge segments that are close to each other (< max_silence_sec gap)
-    """
-    if not timestamps:
-        return []
-    
-    merged = []
-    current = timestamps[0].copy() 
-    
-    for ts in timestamps[1:]:
-        gap = (ts['start'] - current['end']) / sample_rate
-        if gap <= max_silence_sec:
-            current['end'] = ts['end']  # merge with current
-        else:
-            merged.append(current)
-            current = ts.copy()    
-    
-    merged.append(current)  # append the last segment
-    return merged
-
-def get_speech_segments(audio_tensor, sample_rate, min_duration_sec=0.5, max_silence_sec=0.5, chunk_duration_sec=60):
-    """
-    Uses Silero VAD to extract speech-only segments from long audio by chunking first.
-
     Args:
-        audio_tensor (torch.Tensor): Mono audio
-        sample_rate (int): e.g. 16000
-        min_duration_sec (float): Minimum length of accepted segment
-        max_silence_sec (float): Maximum silence between mergeable segments
-        chunk_duration_sec (float): Duration of audio to process at once
-
-    Returns: List of 1D torch.Tensor segments
+        audio_tensor (torch.Tensor): Mono audio tensor
+        sample_rate (int): Sample rate (e.g. 16000)
+        min_duration_sec (float): Minimum segment duration
+        max_silence_sec (float): Maximum silence gap to merge segments
+    
+    Returns:
+        List[torch.Tensor]: List of speech segments
     """
-
+    
     # Early exit on empty input
     if len(audio_tensor) == 0:
         return []
@@ -162,54 +125,82 @@ def get_speech_segments(audio_tensor, sample_rate, min_duration_sec=0.5, max_sil
     except Exception as e:
         raise RuntimeError(f"Failed to load Silero VAD model: {str(e)}")
     
-    chunks = split_audio_tensor(audio_tensor, sample_rate, chunk_duration_sec)
+    # Ensure tensor is float32
+    if audio_tensor.dtype != torch.float32:
+        audio_tensor = audio_tensor.float()
     
-    if not chunks:
+    print(f"Processing audio: {len(audio_tensor) / sample_rate:.1f} seconds")
+    
+    try:
+        # Get speech timestamps directly on the full audio
+        # Silero VAD can handle long audio efficiently
+        timestamps = get_speech_timestamps(
+            audio_tensor, 
+            model, 
+            sampling_rate=sample_rate, 
+            return_seconds=False,
+            min_speech_duration_ms=int(min_duration_sec * 1000),
+            min_silence_duration_ms=100,  # 100ms minimum silence
+            window_size_samples=1536,  # Optimized for 16kHz
+            speech_pad_ms=100  # Add 100ms padding around speech
+        )
+        
+    except Exception as e:
+        print(f"VAD processing error: {str(e)}")
         return []
     
-    all_segments = []
-    sample_offset = 0  # keeps track of where each chunk starts
-
-    for chunk_idx, chunk in enumerate(chunks):
-        try:
-            # Ensure chunk is float32 and properly shaped for VAD
-            if chunk.dtype != torch.float32:
-                chunk = chunk.float()
-            
-            # Get speech timestamps for this chunk
-            timestamps = get_speech_timestamps( # Returns a list of {"start": ..., "end": ...} timestamps in samples, not seconds
-                chunk, 
-                model, 
-                sampling_rate=sample_rate, 
-                return_seconds=False,
-                min_speech_duration_ms=int(min_duration_sec * 1000), # Filters out very short speech blips.
-                min_silence_duration_ms=50  # 50ms minimum silence, Controls minimum gap between segments.
-            )
-            
-            # merge close segments
-            timestamps = merge_segments(timestamps, sample_rate, max_silence_sec=max_silence_sec)
-
-            # extract segments from the original audio
-            for ts in timestamps:
-                start, end = ts['start'], ts['end']
-                duration = (end - start) / sample_rate
-                
-                if duration >= min_duration_sec:
-                    global_start = sample_offset + start
-                    global_end = sample_offset + end # ensures timestamps are relative to the entire audio file, not chunk.
-                    
-                    # don't go beyond the audio length
-                    global_end = min(global_end, len(audio_tensor))
-                    
-                    if global_start < len(audio_tensor) and global_end > global_start:
-                        segment = audio_tensor[global_start:global_end]
-                        if len(segment) > 0:
-                            all_segments.append(segment)
-
-        except Exception as e:
-            print(f"Error processing chunk {chunk_idx}: {str(e)}")
-            continue
+    if not timestamps:
+        print("No speech detected")
+        return []
+    
+    print(f"Found {len(timestamps)} initial speech segments")
+    
+    # Merge nearby segments
+    merged_timestamps = merge_close_segments(timestamps, sample_rate, max_silence_sec)
+    print(f"After merging: {len(merged_timestamps)} segments")
+    
+    # Extract segments from audio
+    segments = []
+    for i, ts in enumerate(merged_timestamps):
+        start, end = ts['start'], ts['end']
+        duration = (end - start) / sample_rate
         
-        sample_offset += len(chunk)
+        # Skip segments that are too short
+        if duration < min_duration_sec:
+            continue
+            
+        # Extract segment
+        segment = audio_tensor[start:end]
+        
+        if len(segment) > 0:
+            segments.append(segment)
+            print(f"Segment {i+1}: {duration:.1f}s")
+    
+    print(f"Final segments: {len(segments)}")
+    return segments
 
-    return all_segments
+def merge_close_segments(timestamps, sample_rate, max_gap_sec=1.0):
+    """
+    Merge segments that are close together
+    """
+    if not timestamps:
+        return []
+    
+    merged = []
+    current = timestamps[0].copy()
+    
+    for ts in timestamps[1:]:
+        gap_sec = (ts['start'] - current['end']) / sample_rate
+        
+        if gap_sec <= max_gap_sec:
+            # Merge segments
+            current['end'] = ts['end']
+        else:
+            # Keep current segment and start new one
+            merged.append(current)
+            current = ts.copy()
+    
+    # Don't forget the last segment
+    merged.append(current)
+    
+    return merged

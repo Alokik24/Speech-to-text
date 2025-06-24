@@ -3,6 +3,7 @@ import os
 from vad_utils import read_audio_mono, get_speech_segments
 from faster_whisper import WhisperModel
 import numpy as np
+import time
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -14,21 +15,27 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 # Initialize model once
 model = WhisperModel("small", device="cpu", compute_type="int8")
 
-MAX_SEGMENT_DURATION_SEC = 30
-
-def split_segment(segment, sample_rate, max_duration_sec=MAX_SEGMENT_DURATION_SEC):
+def split_long_segment(segment, sample_rate, max_duration_sec=30):
     """
-    Split audio segment into smaller chunks
-    Args:
-        segment: 1D pytorch tensor of audio samples (from vad)
-        sample_rate: number of samples per second (16000)
-        max_duration_sec: maximum duration of each chunk in seconds (30 seconds)
+    Split a segment if it's longer than max_duration_sec
+    """
+    segment_duration = len(segment) / sample_rate
     
-    """
-    max_samples = int(max_duration_sec * sample_rate) # convert duration in seconds to samples
-    for start in range(0, len(segment), max_samples): # split audio into non-overlapping segments of at most max_samples
+    if segment_duration <= max_duration_sec:
+        yield segment
+        return
+    
+    # Split into chunks
+    max_samples = int(max_duration_sec * sample_rate)
+    overlap_samples = int(0.5 * sample_rate)  # 0.5 second overlap
+    
+    for start in range(0, len(segment), max_samples - overlap_samples):
         end = min(start + max_samples, len(segment))
-        yield segment[start:end]
+        chunk = segment[start:end]
+        
+        # Skip very short chunks at the end
+        if len(chunk) >= int(0.5 * sample_rate):  # At least 0.5 seconds
+            yield chunk
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -36,6 +43,8 @@ def index():
     error_message = ""
     
     if request.method == 'POST':
+        start_time = time.time()
+        
         try:
             # Check if file was uploaded
             if 'audio' not in request.files:
@@ -53,11 +62,18 @@ def index():
                 # Save uploaded file
                 file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
                 file.save(file_path)
+                print(f"Processing file: {file.filename}")
 
                 try:
-                    # Read audio file and extract speech segments
+                    # Read audio file
+                    print("Loading audio...")
                     audio, sr = read_audio_mono(file_path)
-                    segments = get_speech_segments(audio, sr)
+                    audio_duration = len(audio) / sr
+                    print(f"Audio loaded: {audio_duration:.1f} seconds")
+                    
+                    # Extract speech segments using VAD
+                    print("Extracting speech segments...")
+                    segments = get_speech_segments(audio, sr, min_duration_sec=1.0)
 
                     # Check if any speech segments were found
                     if not segments:
@@ -65,41 +81,72 @@ def index():
                         return render_template('index.html', transcript=transcript, error=error_message)
 
                     # Transcribe each speech segment
+                    print(f"Transcribing {len(segments)} segments...")
                     texts = []
-                    for i, seg in enumerate(segments):
-                        for j, chunk in enumerate(split_segment(seg, sr)):
-                            # Skip chunks that are too long (2 minutes = 120 seconds)
+                    total_segments = 0
+                    
+                    for i, segment in enumerate(segments):
+                        segment_duration = len(segment) / sr
+                        print(f"Processing segment {i+1}/{len(segments)}: {segment_duration:.1f}s")
+                        
+                        # Split long segments
+                        for j, chunk in enumerate(split_long_segment(segment, sr, max_duration_sec=30)):
                             chunk_duration = len(chunk) / sr
-                            if chunk_duration > 120:
-                                print(f"Skipping chunk {i+1}.{j+1} – too long ({chunk_duration:.2f} sec)")
+                            
+                            # Skip very short chunks
+                            if chunk_duration < 0.5:
                                 continue
-
-                            # Skip very short chunks (less than 0.1 seconds)
-                            if chunk_duration < 0.1:
-                                print(f"Skipping chunk {i+1}.{j+1} – too short ({chunk_duration:.2f} sec)")
+                                
+                            total_segments += 1
+                            print(f"  Chunk {j+1}: {chunk_duration:.1f}s")
+                            
+                            # Convert to numpy array for Whisper
+                            chunk_np = chunk.numpy().astype(np.float32)
+                            
+                            try:
+                                # Transcribe
+                                segments_result, info = model.transcribe(
+                                    chunk_np, 
+                                    language="en",
+                                    condition_on_previous_text=False,  # Better for independent segments
+                                    vad_filter=False,  # We already did VAD
+                                    word_timestamps=False  # Faster without word timestamps
+                                )
+                                
+                                # Extract text
+                                text_parts = []
+                                for segment in segments_result:
+                                    if segment.text.strip():
+                                        text_parts.append(segment.text.strip())
+                                
+                                if text_parts:
+                                    chunk_text = " ".join(text_parts)
+                                    texts.append(chunk_text)
+                                    print(f"    -> {len(chunk_text)} chars")
+                                
+                            except Exception as e:
+                                print(f"    -> Error transcribing chunk: {e}")
                                 continue
-
-                            print(f"Processing chunk {i+1}.{j+1}: {chunk_duration:.2f} sec")
-                            
-                            # Convert to numpy array with proper dtype
-                            seg_np = chunk.numpy().astype(np.float32)
-                            
-                            # Transcribe the chunk
-                            segments_result, _ = model.transcribe(seg_np, language="en")
-                            text = " ".join([segment.text.strip() for segment in segments_result])
-                            
-                            if text.strip():  # Only add non-empty transcriptions
-                                texts.append(text.strip())
 
                     # Join all transcribed text
                     transcript = " ".join(texts)
                     
+                    # Processing time
+                    processing_time = time.time() - start_time
+                    print(f"Processing completed in {processing_time:.1f}s")
+                    print(f"Audio duration: {audio_duration:.1f}s, Processing time: {processing_time:.1f}s")
+                    print(f"Speed ratio: {audio_duration/processing_time:.1f}x")
+                    
                     if not transcript.strip():
                         error_message = "No speech could be transcribed from the audio file"
+                    else:
+                        print(f"Transcript length: {len(transcript)} characters")
 
                 except Exception as e:
                     error_message = f"Error processing audio: {str(e)}"
                     print(f"Audio processing error: {e}")
+                    import traceback
+                    traceback.print_exc()
                 
                 finally:
                     # Clean up uploaded file
@@ -116,6 +163,8 @@ def index():
         except Exception as e:
             error_message = f"Unexpected error: {str(e)}"
             print(f"Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
     
     return render_template('index.html', transcript=transcript, error=error_message)
 
