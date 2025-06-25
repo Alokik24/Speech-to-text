@@ -13,7 +13,16 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 
 
-model = WhisperModel("small", device="cpu", compute_type="int8")
+model = None
+model_loaded = False
+
+@app.before_request
+def load_model_once():
+    global model, model_loaded
+    if not model_loaded:
+        print("Loading Whisper model...")
+        model = WhisperModel("small", device="cpu", compute_type="int8")
+        model_loaded = True
 
 def split_long_segment(segment, sample_rate, max_duration_sec=150):
     """
@@ -81,13 +90,15 @@ def index():
                         return render_template('index.html', transcript=transcript, error=error_message)
 
                     # Transcribe each speech segment
-                    print(f"Transcribing {len(segments)} segments...")
+                    if app.debug:
+                        print(f"Transcribing {len(segments)} segments...")
                     texts = []
                     total_segments = 0
                     
                     for i, segment in enumerate(segments):
                         segment_duration = len(segment) / sr
-                        print(f"Processing segment {i+1}/{len(segments)}: {segment_duration:.1f}s")
+                        if app.debug:
+                            print(f"Processing segment {i+1}/{len(segments)}: {segment_duration:.1f}s")
                         
                         # Split long segments
                         for j, chunk in enumerate(split_long_segment(segment, sr, max_duration_sec=120)):
@@ -98,7 +109,8 @@ def index():
                                 continue
                                 
                             total_segments += 1
-                            print(f"  Chunk {j+1}: {chunk_duration:.1f}s")
+                            if app.debug:
+                                print(f"  Chunk {j+1}: {chunk_duration:.1f}s")
                             
                             # Convert to numpy array for Whisper
                             chunk_np = chunk.contiguous().numpy().astype(np.float32)

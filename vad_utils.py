@@ -4,6 +4,10 @@ import os
 import subprocess
 import shutil
 from silero_vad import get_speech_timestamps, load_silero_vad
+from torchaudio.transforms import Resample
+
+
+torchaudio.set_audio_backend("sox_io")
 
 # Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +40,16 @@ def find_ffmpeg():
     return None
 
 FFMPEG_BIN = find_ffmpeg()
+
+# ---- VAD model cache ----
+_vad_model = None
+
+def get_cached_vad():
+    global _vad_model
+    if _vad_model is None:
+        print("Loading Silero VAD model...")
+        _vad_model = load_silero_vad()
+    return _vad_model
 
 def convert_to_wav(input_file):
     """Convert audio file to WAV format using ffmpeg"""
@@ -73,34 +87,34 @@ def convert_to_wav(input_file):
     return wav_path
 
 def read_audio_mono(file_path, target_sr=16000):
-    """Read audio file and convert to mono with target sample rate"""
-    original_path = file_path
-    
+    """
+    Load audio file, convert to mono, and resample to target_sr if needed.
+    Returns:
+        waveform (1D torch.Tensor), sample_rate (int)
+    """
     # Convert to WAV if not already
     if not file_path.lower().endswith('.wav'):
         file_path = convert_to_wav(file_path)
-    
+
     try:
         waveform, sr = torchaudio.load(file_path)
     except Exception as e:
         raise RuntimeError(f"Failed to load audio file: {str(e)}")
-    
-    # Resample if necessary
-    if sr != target_sr:
-        try:
-            waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-        except Exception as e:
-            raise RuntimeError(f"Failed to resample audio: {str(e)}")
-    
+
     # Convert to mono if stereo
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
-    
-    # Ensure 1D tensor
-    if waveform.dim() > 1:
-        waveform = waveform.squeeze()
-    
-    return waveform, target_sr
+
+    # Resample if needed
+    if sr != target_sr:
+        try:
+            resampler = Resample(orig_freq=sr, new_freq=target_sr)
+            waveform = resampler(waveform)
+            sr = target_sr
+        except Exception as e:
+            raise RuntimeError(f"Failed to resample audio: {str(e)}")
+
+    return waveform.squeeze(), sr
 
 def get_speech_segments(audio_tensor, sample_rate, min_duration_sec=0.5, max_silence_sec=2.0):
     """
@@ -121,7 +135,7 @@ def get_speech_segments(audio_tensor, sample_rate, min_duration_sec=0.5, max_sil
         return []
     
     try:
-        model = load_silero_vad()
+        model = get_cached_vad()
     except Exception as e:
         raise RuntimeError(f"Failed to load Silero VAD model: {str(e)}")
     
@@ -134,16 +148,17 @@ def get_speech_segments(audio_tensor, sample_rate, min_duration_sec=0.5, max_sil
     try:
         # Get speech timestamps directly on the full audio
         # Silero VAD can handle long audio efficiently
-        timestamps = get_speech_timestamps(
-            audio_tensor, 
-            model, 
-            sampling_rate=sample_rate, 
-            return_seconds=False,
-            min_speech_duration_ms=int(min_duration_sec * 1000),
-            min_silence_duration_ms=100,  # 100ms minimum silence
-            window_size_samples=1536,  # Optimized for 16kHz
-            speech_pad_ms=100  # Add 100ms padding around speech
-        )
+        with torch.no_grad():
+            timestamps = get_speech_timestamps(
+                audio_tensor, 
+                model, 
+                sampling_rate=sample_rate, 
+                return_seconds=False,
+                min_speech_duration_ms=int(min_duration_sec * 1000),
+                min_silence_duration_ms=100,  # 100ms minimum silence
+                window_size_samples=1536,  # Optimized for 16kHz
+                speech_pad_ms=100  # Add 100ms padding around speech
+            )
         
     except Exception as e:
         print(f"VAD processing error: {str(e)}")
