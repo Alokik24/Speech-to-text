@@ -12,10 +12,10 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 
-# Initialize model once
+
 model = WhisperModel("small", device="cpu", compute_type="int8")
 
-def split_long_segment(segment, sample_rate, max_duration_sec=30):
+def split_long_segment(segment, sample_rate, max_duration_sec=150):
     """
     Split a segment if it's longer than max_duration_sec
     """
@@ -90,27 +90,28 @@ def index():
                         print(f"Processing segment {i+1}/{len(segments)}: {segment_duration:.1f}s")
                         
                         # Split long segments
-                        for j, chunk in enumerate(split_long_segment(segment, sr, max_duration_sec=30)):
+                        for j, chunk in enumerate(split_long_segment(segment, sr, max_duration_sec=120)):
                             chunk_duration = len(chunk) / sr
                             
                             # Skip very short chunks
-                            if chunk_duration < 0.5:
+                            if chunk_duration < 1:
                                 continue
                                 
                             total_segments += 1
                             print(f"  Chunk {j+1}: {chunk_duration:.1f}s")
                             
                             # Convert to numpy array for Whisper
-                            chunk_np = chunk.numpy().astype(np.float32)
+                            chunk_np = chunk.contiguous().numpy().astype(np.float32)
                             
                             try:
                                 # Transcribe
                                 segments_result, info = model.transcribe(
                                     chunk_np, 
                                     language="en",
-                                    condition_on_previous_text=False,  # Better for independent segments
+                                    condition_on_previous_text=True,
                                     vad_filter=False,  # We already did VAD
-                                    word_timestamps=False  # Faster without word timestamps
+                                    word_timestamps=False,  # Faster without word timestamps
+                                    beam_size=1
                                 )
                                 
                                 # Extract text

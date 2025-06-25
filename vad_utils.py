@@ -102,7 +102,7 @@ def read_audio_mono(file_path, target_sr=16000):
     
     return waveform, target_sr
 
-def get_speech_segments(audio_tensor, sample_rate, min_duration_sec=0.5, max_silence_sec=1.0):
+def get_speech_segments(audio_tensor, sample_rate, min_duration_sec=0.5, max_silence_sec=2.0):
     """
     Simplified and optimized speech segment extraction using Silero VAD.
     
